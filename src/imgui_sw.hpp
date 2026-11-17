@@ -6,44 +6,53 @@
 // WHAT:
 //   This is a software renderer for Dear ImGui.
 //   It is decently fast, but has a lot of room for optimization.
-//   The goal was to get something fast and decently accurate in not too many lines of code.
-// LIMITATIONS:
-//   * It is not pixel-perfect, but it is good enough for must use cases.
-//   * It does not support painting with any other texture than the default font texture.
 #pragma once
 
 #include <cstdint>
 
+struct ImDrawData;
 namespace imgui_sw {
+
+struct Texture
+{
+  // User textures use the same packed 32-bit color layout as Dear ImGui
+  // (RGBA byte order by default, BGRA with IMGUI_USE_BGRA_PACKED_COLOR).
+  const uint32_t *pixels = nullptr;
+  int width = 0;
+  int height = 0;
+  bool bilinear = false; // User images default to nearest; ImGui atlases require linear filtering.
+  bool alpha8 = false;   // Alpha-only atlas storage, interpreted as white with coverage.
+};
+
 
 struct SwOptions
 {
-	bool optimize_text = true;  // No reason to turn this off.
-	bool optimize_rectangles = true; // No reason to turn this off.
+  bool optimize_text = true;       // Fast path for axis-aligned textured quads.
+  bool optimize_rectangles = true; // Fast path for uniform filled rectangles.
 };
 
-/// Optional: tweak ImGui style to make it render faster.
+
 void make_style_fast();
 
 /// Undo what make_style_fast did.
 void restore_style();
 
-/// Call once a the start of your program.
+
 void bind_imgui_painting();
 
-/// The buffer is assumed to follow how ImGui packs pixels, i.e. ABGR by default.
-/// Change with IMGUI_USE_BGRA_PACKED_COLOR.
-/// If width/height differs from ImGui::GetIO().DisplaySize then
-/// the function scales the UI to fit the given pixel buffer.
-void paint_imgui(uint32_t* pixels, int width_pixels, int height_pixels, const SwOptions& options = {});
 
-/// Free the resources allocated by bind_imgui_painting.
+bool rebuild_font_texture();
+
+
+void paint_imgui(uint32_t *pixels, ImDrawData *data, const SwOptions &options = {});
+
+
 void unbind_imgui_painting();
 
-/// Show ImGui controls for rendering options if you want to.
-bool show_options(SwOptions* io_options);
 
-/// Show rendering stats in an ImGui window if you want to.
+bool show_options(SwOptions *io_options);
+
+
 void show_stats();
 
-} // namespace imgui_sw
+}// namespace imgui_sw

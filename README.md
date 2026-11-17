@@ -1,3 +1,14 @@
+# imguisw
+
+A fork of [emilk/imgui_software_renderer](https://github.com/emilk/imgui_software_renderer),
+used by Multitap's Test libretro core. `src/imgui_sw.cpp` / `src/imgui_sw.hpp` are adapted to
+Dear ImGui 1.92+ (dynamic font textures: `ImTextureData`, `ImGuiBackendFlags_RendererHasTextures`,
+`ImDrawCmd::GetTexID()`), taken from the copy in
+[mlcodewerks/detonate](https://github.com/mlcodewerks/detonate/tree/main/src/deps/imgui). Same
+license as the original (below). `main.cpp` and the example build are left as upstream had them.
+
+---
+
 # Dear ImGui software renderer
 This is a software renderer for [Dear ImGui](https://github.com/ocornut/imgui).
 I built it not out of a specific need, but because it was fun.

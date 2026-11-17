@@ -6,728 +6,961 @@
 #include "imgui_sw.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
-#include <vector>
+#include <cstdint>
 
-#include <imgui/imgui.h>
+#include <imgui.h>
 
-namespace imgui_sw {
-namespace {
-
-struct Stats
+namespace imgui_sw
 {
-	int    uniform_triangle_pixels            = 0;
-	int    textured_triangle_pixels           = 0;
-	int    gradient_triangle_pixels           = 0;
-	int    font_pixels                        = 0;
-	double uniform_rectangle_pixels           = 0;
-	double textured_rectangle_pixels          = 0;
-	double gradient_rectangle_pixels          = 0;
-	double gradient_textured_rectangle_pixels = 0;
-};
-
-struct Texture
-{
-	const uint8_t* pixels; // 8-bit.
-	int            width;
-	int            height;
-};
-
-struct PaintTarget
-{
-	uint32_t* pixels;
-	int       width;
-	int       height;
-	ImVec2    scale; // Multiply ImGui (point) coordinates with this to get pixel coordinates.
-};
-
-// ----------------------------------------------------------------------------
-
-struct ColorInt
-{
-	uint32_t a, b, g, r;
-
-	ColorInt() = default;
-
-	explicit ColorInt(uint32_t x)
-	{
-		a = (x >> IM_COL32_A_SHIFT) & 0xFFu;
-		b = (x >> IM_COL32_B_SHIFT) & 0xFFu;
-		g = (x >> IM_COL32_G_SHIFT) & 0xFFu;
-		r = (x >> IM_COL32_R_SHIFT) & 0xFFu;
-	}
-
-	uint32_t toUint32() const
-	{
-		return (a << 24u) | (b << 16u) | (g << 8u) | r;
-	}
-};
-
-ColorInt blend(ColorInt target, ColorInt source)
-{
-	ColorInt result;
-	result.a = 0; // Whatever.
-	result.b = (source.b * source.a + target.b * (255 - source.a)) / 255;
-	result.g = (source.g * source.a + target.g * (255 - source.a)) / 255;
-	result.r = (source.r * source.a + target.r * (255 - source.a)) / 255;
-	return result;
-}
-
-// ----------------------------------------------------------------------------
-// Used for interpolating vertex attributes (color and texture coordinates) in a triangle.
-
-struct Barycentric
-{
-	float w0, w1, w2;
-};
-
-Barycentric operator*(const float f, const Barycentric& va)
-{
-	return { f * va.w0, f * va.w1, f * va.w2 };
-}
-
-void operator+=(Barycentric& a, const Barycentric& b)
-{
-	a.w0 += b.w0;
-	a.w1 += b.w1;
-	a.w2 += b.w2;
-}
-
-Barycentric operator+(const Barycentric& a, const Barycentric& b)
-{
-	return Barycentric{ a.w0 + b.w0, a.w1 + b.w1, a.w2 + b.w2 };
-}
-
-// ----------------------------------------------------------------------------
-// Useful operators on ImGui vectors:
-
-ImVec2 operator*(const float f, const ImVec2& v)
-{
-	return ImVec2{f * v.x, f * v.y};
-}
-
-ImVec2 operator+(const ImVec2& a, const ImVec2& b)
-{
-	return ImVec2{a.x + b.x, a.y + b.y};
-}
-
-ImVec2 operator-(const ImVec2& a, const ImVec2& b)
-{
-	return ImVec2{a.x - b.x, a.y - b.y};
-}
-
-bool operator!=(const ImVec2& a, const ImVec2& b)
-{
-	return a.x != b.x || a.y != b.y;
-}
-
-ImVec4 operator*(const float f, const ImVec4& v)
-{
-	return ImVec4{f * v.x, f * v.y, f * v.z, f * v.w};
-}
-
-ImVec4 operator+(const ImVec4& a, const ImVec4& b)
-{
-	return ImVec4{a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w};
-}
-
-// ----------------------------------------------------------------------------
-// Copies of functions in ImGui, inlined for speed:
-
-ImVec4 color_convert_u32_to_float4(ImU32 in)
-{
-	const float s = 1.0f / 255.0f;
-	return ImVec4(
-		((in >> IM_COL32_R_SHIFT) & 0xFF) * s,
-		((in >> IM_COL32_G_SHIFT) & 0xFF) * s,
-		((in >> IM_COL32_B_SHIFT) & 0xFF) * s,
-		((in >> IM_COL32_A_SHIFT) & 0xFF) * s);
-}
-
-ImU32 color_convert_float4_to_u32(const ImVec4& in)
-{
-	ImU32 out;
-	out  = uint32_t(in.x * 255.0f + 0.5f) << IM_COL32_R_SHIFT;
-	out |= uint32_t(in.y * 255.0f + 0.5f) << IM_COL32_G_SHIFT;
-	out |= uint32_t(in.z * 255.0f + 0.5f) << IM_COL32_B_SHIFT;
-	out |= uint32_t(in.w * 255.0f + 0.5f) << IM_COL32_A_SHIFT;
-	return out;
-}
-
-// ----------------------------------------------------------------------------
-// For fast and subpixel-perfect triangle rendering we used fixed point arithmetic.
-// To keep the code simple we use 64 bits to avoid overflows.
-
-using Int = int64_t;
-const Int kFixedBias = 256;
-
-struct Point
-{
-	Int x, y;
-};
-
-Int orient2d(const Point& a, const Point& b, const Point& c)
-{
-	return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-}
-
-Int as_int(float v)
-{
-	return static_cast<Int>(std::floor(v * kFixedBias));
-}
-
-Point as_point(ImVec2 v)
-{
-	return Point{as_int(v.x), as_int(v.y)};
-}
-
-// ----------------------------------------------------------------------------
-
-float min3(float a, float b, float c)
-{
-	if (a < b && a < c) { return a; }
-	return b < c ? b : c;
-}
-
-float max3(float a, float b, float c)
-{
-	if (a > b && a > c) { return a; }
-	return b > c ? b : c;
-}
-
-float barycentric(const ImVec2& a, const ImVec2& b, const ImVec2& point)
-{
-	return (b.x - a.x) * (point.y - a.y) - (b.y - a.y) * (point.x - a.x);
-}
-
-inline uint8_t sample_texture(const Texture& texture, const ImVec2& uv)
-{
-	int tx = static_cast<int>(uv.x * (texture.width  - 1.0f) + 0.5f);
-	int ty = static_cast<int>(uv.y * (texture.height - 1.0f) + 0.5f);
-
-	// Clamp to inside of texture:
-	tx = std::max(tx, 0);
-	tx = std::min(tx, texture.width - 1);
-	ty = std::max(ty, 0);
-	ty = std::min(ty, texture.height - 1);
-
-	return texture.pixels[ty * texture.width + tx];
-}
-
-void paint_uniform_rectangle(
-	const PaintTarget& target,
-	const ImVec2&      min_f,
-	const ImVec2&      max_f,
-	const ColorInt&    color,
-	Stats*             stats)
-{
-	// Integer bounding box [min, max):
-	int min_x_i = static_cast<int>(target.scale.x * min_f.x + 0.5f);
-	int min_y_i = static_cast<int>(target.scale.y * min_f.y + 0.5f);
-	int max_x_i = static_cast<int>(target.scale.x * max_f.x + 0.5f);
-	int max_y_i = static_cast<int>(target.scale.y * max_f.y + 0.5f);
-
-	// Clamp to render target:
-	min_x_i = std::max(min_x_i, 0);
-	min_y_i = std::max(min_y_i, 0);
-	max_x_i = std::min(max_x_i, target.width);
-	max_y_i = std::min(max_y_i, target.height);
-
-	stats->uniform_rectangle_pixels += (max_x_i - min_x_i) * (max_y_i - min_y_i);
-
-	// We often blend the same colors over and over again, so optimize for this (saves 25% total cpu):
-	uint32_t last_target_pixel = target.pixels[min_y_i * target.width + min_x_i];
-	uint32_t last_output = blend(ColorInt(last_target_pixel), color).toUint32();
-
-	for (int y = min_y_i; y < max_y_i; ++y) {
-		for (int x = min_x_i; x < max_x_i; ++x) {
-			uint32_t& target_pixel = target.pixels[y * target.width + x];
-			if (target_pixel == last_target_pixel) {
-				target_pixel = last_output;
-				continue;
-			}
-			last_target_pixel = target_pixel;
-			target_pixel = blend(ColorInt(target_pixel), color).toUint32();
-			last_output = target_pixel;
-		}
-	}
-}
-
-void paint_uniform_textured_rectangle(
-	const PaintTarget& target,
-	const Texture&     texture,
-	const ImVec4&      clip_rect,
-	const ImDrawVert&  min_v,
-	const ImDrawVert&  max_v,
-	Stats*             stats)
-{
-	const ImVec2 min_p = ImVec2(target.scale.x * min_v.pos.x, target.scale.y * min_v.pos.y);
-	const ImVec2 max_p = ImVec2(target.scale.x * max_v.pos.x, target.scale.y * max_v.pos.y);
-
-	// Find bounding box:
-	float min_x_f = min_p.x;
-	float min_y_f = min_p.y;
-	float max_x_f = max_p.x;
-	float max_y_f = max_p.y;
-
-	// Clip against clip_rect:
-	min_x_f = std::max(min_x_f, target.scale.x * clip_rect.x);
-	min_y_f = std::max(min_y_f, target.scale.y * clip_rect.y);
-	max_x_f = std::min(max_x_f, target.scale.x * clip_rect.z - 0.5f);
-	max_y_f = std::min(max_y_f, target.scale.y * clip_rect.w - 0.5f);
-
-	// Integer bounding box [min, max):
-	int min_x_i = static_cast<int>(min_x_f);
-	int min_y_i = static_cast<int>(min_y_f);
-	int max_x_i = static_cast<int>(max_x_f + 1.0f);
-	int max_y_i = static_cast<int>(max_y_f + 1.0f);
-
-	// Clip against render target:
-	min_x_i = std::max(min_x_i, 0);
-	min_y_i = std::max(min_y_i, 0);
-	max_x_i = std::min(max_x_i, target.width);
-	max_y_i = std::min(max_y_i, target.height);
-
-	stats->font_pixels += (max_x_i - min_x_i) * (max_y_i - min_y_i);
-
-	const auto topleft = ImVec2(min_x_i + 0.5f * target.scale.x,
-	                            min_y_i + 0.5f * target.scale.y);
-
-	const ImVec2 delta_uv_per_pixel = {
-		(max_v.uv.x - min_v.uv.x) / (max_p.x - min_p.x),
-		(max_v.uv.y - min_v.uv.y) / (max_p.y - min_p.y),
-	};
-	const ImVec2 uv_topleft = {
-		min_v.uv.x + (topleft.x - min_v.pos.x) * delta_uv_per_pixel.x,
-		min_v.uv.y + (topleft.y - min_v.pos.y) * delta_uv_per_pixel.y,
-	};
-	ImVec2 current_uv = uv_topleft;
-
-	for (int y = min_y_i; y < max_y_i; ++y, current_uv.y += delta_uv_per_pixel.y) {
-		current_uv.x = uv_topleft.x;
-		for (int x = min_x_i; x < max_x_i; ++x, current_uv.x += delta_uv_per_pixel.x) {
-			uint32_t& target_pixel = target.pixels[y * target.width + x];
-			const uint8_t texel = sample_texture(texture, current_uv);
-
-			// The font texture is all black or all white, so optimize for this:
-			if (texel == 0) { continue; }
-			if (texel == 255) {
-				target_pixel = min_v.col;
-				continue;
-			}
-
-			// Other textured rectangles
-			ColorInt source_color = ColorInt(min_v.col);
-			source_color.a = source_color.a * texel / 255;
-			target_pixel = blend(ColorInt(target_pixel), source_color).toUint32();
-		}
-	}
-}
-
-// When two triangles share an edge, we want to draw the pixels on that edge exactly once.
-// The edge will be the same, but the direction will be the opposite
-// (assuming the two triangles have the same winding order).
-// Which edge wins? This functions decides.
-bool is_dominant_edge(ImVec2 edge)
-{
-	// return edge.x < 0 || (edge.x == 0 && edge.y > 0);
-	return edge.y > 0 || (edge.y == 0 && edge.x < 0);
-}
-
-// Handles triangles in any winding order (CW/CCW)
-void paint_triangle(
-	const PaintTarget& target,
-	const Texture*     texture,
-	const ImVec4&      clip_rect,
-	const ImDrawVert&  v0,
-	const ImDrawVert&  v1,
-	const ImDrawVert&  v2,
-	Stats*             stats)
-{
-	const ImVec2 p0 = ImVec2(target.scale.x * v0.pos.x, target.scale.y * v0.pos.y);
-	const ImVec2 p1 = ImVec2(target.scale.x * v1.pos.x, target.scale.y * v1.pos.y);
-	const ImVec2 p2 = ImVec2(target.scale.x * v2.pos.x, target.scale.y * v2.pos.y);
-
-	const auto rect_area = barycentric(p0, p1, p2); // Can be positive or negative depending on winding order
-	if (rect_area == 0.0f) { return; }
-	// if (rect_area < 0.0f) { return paint_triangle(target, texture, clip_rect, v0, v2, v1, stats); }
-
-	// Find bounding box:
-	float min_x_f = min3(p0.x, p1.x, p2.x);
-	float min_y_f = min3(p0.y, p1.y, p2.y);
-	float max_x_f = max3(p0.x, p1.x, p2.x);
-	float max_y_f = max3(p0.y, p1.y, p2.y);
-
-	// Clip against clip_rect:
-	min_x_f = std::max(min_x_f, target.scale.x * clip_rect.x);
-	min_y_f = std::max(min_y_f, target.scale.y * clip_rect.y);
-	max_x_f = std::min(max_x_f, target.scale.x * clip_rect.z - 0.5f);
-	max_y_f = std::min(max_y_f, target.scale.y * clip_rect.w - 0.5f);
-
-	// Integer bounding box [min, max):
-	int min_x_i = static_cast<int>(min_x_f);
-	int min_y_i = static_cast<int>(min_y_f);
-	int max_x_i = static_cast<int>(max_x_f + 1.0f);
-	int max_y_i = static_cast<int>(max_y_f + 1.0f);
-
-	// Clip against render target:
-	min_x_i = std::max(min_x_i, 0);
-	min_y_i = std::max(min_y_i, 0);
-	max_x_i = std::min(max_x_i, target.width);
-	max_y_i = std::min(max_y_i, target.height);
-
-	// ------------------------------------------------------------------------
-	// Set up interpolation of barycentric coordinates:
-
-	const auto topleft = ImVec2(min_x_i + 0.5f * target.scale.x,
-	                            min_y_i + 0.5f * target.scale.y);
-	const auto dx = ImVec2(1, 0);
-	const auto dy = ImVec2(0, 1);
-
-	const auto w0_topleft = barycentric(p1, p2, topleft);
-	const auto w1_topleft = barycentric(p2, p0, topleft);
-	const auto w2_topleft = barycentric(p0, p1, topleft);
-
-	const auto w0_dx = barycentric(p1, p2, topleft + dx) - w0_topleft;
-	const auto w1_dx = barycentric(p2, p0, topleft + dx) - w1_topleft;
-	const auto w2_dx = barycentric(p0, p1, topleft + dx) - w2_topleft;
-
-	const auto w0_dy = barycentric(p1, p2, topleft + dy) - w0_topleft;
-	const auto w1_dy = barycentric(p2, p0, topleft + dy) - w1_topleft;
-	const auto w2_dy = barycentric(p0, p1, topleft + dy) - w2_topleft;
-
-	const Barycentric bary_0 { 1, 0, 0 };
-	const Barycentric bary_1 { 0, 1, 0 };
-	const Barycentric bary_2 { 0, 0, 1 };
-
-	const auto inv_area = 1 / rect_area;
-	const Barycentric bary_topleft = inv_area * (w0_topleft * bary_0 + w1_topleft * bary_1 + w2_topleft * bary_2);
-	const Barycentric bary_dx      = inv_area * (w0_dx      * bary_0 + w1_dx      * bary_1 + w2_dx      * bary_2);
-	const Barycentric bary_dy      = inv_area * (w0_dy      * bary_0 + w1_dy      * bary_1 + w2_dy      * bary_2);
-
-	Barycentric bary_current_row = bary_topleft;
-
-	// ------------------------------------------------------------------------
-	// For pixel-perfect inside/outside testing:
-
-	const int sign = rect_area > 0 ? 1 : -1; // winding order?
-
-	const int bias0i = is_dominant_edge(p2 - p1) ? 0 : -1;
-	const int bias1i = is_dominant_edge(p0 - p2) ? 0 : -1;
-	const int bias2i = is_dominant_edge(p1 - p0) ? 0 : -1;
-
-	const auto p0i = as_point(p0);
-	const auto p1i = as_point(p1);
-	const auto p2i = as_point(p2);
-
-	// ------------------------------------------------------------------------
-
-	const bool has_uniform_color = (v0.col == v1.col && v0.col == v2.col);
-
-	const ImVec4 c0 = color_convert_u32_to_float4(v0.col);
-	const ImVec4 c1 = color_convert_u32_to_float4(v1.col);
-	const ImVec4 c2 = color_convert_u32_to_float4(v2.col);
-
-	// We often blend the same colors over and over again, so optimize for this (saves 10% total cpu):
-	uint32_t last_target_pixel = 0;
-	uint32_t last_output = blend(ColorInt(last_target_pixel), ColorInt(v0.col)).toUint32();
-
-	for (int y = min_y_i; y < max_y_i; ++y) {
-		auto bary = bary_current_row;
-
-		bool has_been_inside_this_row = false;
-
-		for (int x = min_x_i; x < max_x_i; ++x) {
-			const auto w0 = bary.w0;
-			const auto w1 = bary.w1;
-			const auto w2 = bary.w2;
-			bary += bary_dx;
-
-			{
-				// Inside/outside test:
-				const auto p = Point{kFixedBias * x + kFixedBias / 2, kFixedBias * y + kFixedBias / 2};
-				const auto w0i = sign * orient2d(p1i, p2i, p) + bias0i;
-				const auto w1i = sign * orient2d(p2i, p0i, p) + bias1i;
-				const auto w2i = sign * orient2d(p0i, p1i, p) + bias2i;
-				if (w0i < 0 || w1i < 0 || w2i < 0) {
-					if (has_been_inside_this_row) {
-						break; // Gives a nice 10% speedup
-					} else {
-						continue;
-					}
-				}
-			}
-			has_been_inside_this_row = true;
-
-			uint32_t& target_pixel = target.pixels[y * target.width + x];
-
-			if (has_uniform_color && !texture) {
-				stats->uniform_triangle_pixels += 1;
-				if (target_pixel == last_target_pixel) {
-					target_pixel = last_output;
-					continue;
-				}
-				last_target_pixel = target_pixel;
-				target_pixel = blend(ColorInt(target_pixel), ColorInt(v0.col)).toUint32();
-				last_output = target_pixel;
-				continue;
-			}
-
-			ImVec4 src_color;
-
-			if (has_uniform_color) {
-				src_color = c0;
-			} else {
-				stats->gradient_triangle_pixels += 1;
-				src_color = w0 * c0 + w1 * c1 + w2 * c2;
-			}
-
-			if (texture) {
-				stats->textured_triangle_pixels += 1;
-				const ImVec2 uv = w0 * v0.uv + w1 * v1.uv + w2 * v2.uv;
-				src_color.w *= sample_texture(*texture, uv) / 255.0f;
-			}
-
-			if (src_color.w <= 0.0f) { continue; } // Transparent.
-			if (src_color.w >= 1.0f) {
-				// Opaque, no blending needed:
-				target_pixel = color_convert_float4_to_u32(src_color);
-				continue;
-			}
-
-			ImVec4 target_color = color_convert_u32_to_float4(target_pixel);
-			const auto blended_color = src_color.w * src_color + (1.0f - src_color.w) * target_color;
-			target_pixel = color_convert_float4_to_u32(blended_color);
-		}
-
-		bary_current_row += bary_dy;
-	}
-}
-
-void paint_draw_cmd(
-	const PaintTarget& target,
-	const ImDrawVert*  vertices,
-	const ImDrawIdx*   idx_buffer,
-	const ImDrawCmd&   pcmd,
-	const SwOptions&   options,
-	Stats*             stats)
-{
-	const auto texture = reinterpret_cast<const Texture*>(pcmd.TextureId);
-	assert(texture);
-
-	// ImGui uses the first pixel for "white".
-	const ImVec2 white_uv = ImVec2(0.5f / texture->width, 0.5f / texture->height);
-
-	for (int i = 0; i + 3 <= pcmd.ElemCount; ) {
-		const ImDrawVert& v0 = vertices[idx_buffer[i + 0]];
-		const ImDrawVert& v1 = vertices[idx_buffer[i + 1]];
-		const ImDrawVert& v2 = vertices[idx_buffer[i + 2]];
-
-		// Text is common, and is made of textured rectangles. So let's optimize for it.
-		// This assumes the ImGui way to layout text does not change.
-		if (options.optimize_text && i + 6 <= pcmd.ElemCount &&
-		    idx_buffer[i + 3] == idx_buffer[i + 0] && idx_buffer[i + 4] == idx_buffer[i + 2]) {
-			const ImDrawVert& v3 = vertices[idx_buffer[i + 5]];
-
-			if (v0.pos.x == v3.pos.x &&
-			    v1.pos.x == v2.pos.x &&
-			    v0.pos.y == v1.pos.y &&
-			    v2.pos.y == v3.pos.y &&
-			    v0.uv.x == v3.uv.x &&
-			    v1.uv.x == v2.uv.x &&
-			    v0.uv.y == v1.uv.y &&
-			    v2.uv.y == v3.uv.y)
-			{
-				const bool has_uniform_color =
-					v0.col == v1.col &&
-					v0.col == v2.col &&
-					v0.col == v3.col;
-
-				const bool has_texture =
-					v0.uv != white_uv ||
-					v1.uv != white_uv ||
-					v2.uv != white_uv ||
-					v3.uv != white_uv;
-
-				if (has_uniform_color && has_texture)
-				{
-					paint_uniform_textured_rectangle(target, *texture, pcmd.ClipRect, v0, v2, stats);
-					i += 6;
-					continue;
-				}
-			}
-		}
-
-		// A lot of the big stuff are uniformly colored rectangles,
-		// so we can save a lot of CPU by detecting them:
-		if (options.optimize_rectangles && i + 6 <= pcmd.ElemCount) {
-			const ImDrawVert& v3 = vertices[idx_buffer[i + 3]];
-			const ImDrawVert& v4 = vertices[idx_buffer[i + 4]];
-			const ImDrawVert& v5 = vertices[idx_buffer[i + 5]];
-
-			ImVec2 min, max;
-			min.x = min3(v0.pos.x, v1.pos.x, v2.pos.x);
-			min.y = min3(v0.pos.y, v1.pos.y, v2.pos.y);
-			max.x = max3(v0.pos.x, v1.pos.x, v2.pos.x);
-			max.y = max3(v0.pos.y, v1.pos.y, v2.pos.y);
-
-			// Not the prettiest way to do this, but it catches all cases
-			// of a rectangle split into two triangles.
-			// TODO: Stop it from also assuming duplicate triangles is one rectangle.
-			if ((v0.pos.x == min.x || v0.pos.x == max.x) &&
-				(v0.pos.y == min.y || v0.pos.y == max.y) &&
-				(v1.pos.x == min.x || v1.pos.x == max.x) &&
-				(v1.pos.y == min.y || v1.pos.y == max.y) &&
-				(v2.pos.x == min.x || v2.pos.x == max.x) &&
-				(v2.pos.y == min.y || v2.pos.y == max.y) &&
-				(v3.pos.x == min.x || v3.pos.x == max.x) &&
-				(v3.pos.y == min.y || v3.pos.y == max.y) &&
-				(v4.pos.x == min.x || v4.pos.x == max.x) &&
-				(v4.pos.y == min.y || v4.pos.y == max.y) &&
-				(v5.pos.x == min.x || v5.pos.x == max.x) &&
-				(v5.pos.y == min.y || v5.pos.y == max.y))
-			{
-				const bool has_uniform_color =
-					v0.col == v1.col &&
-					v0.col == v2.col &&
-					v0.col == v3.col &&
-					v0.col == v4.col &&
-					v0.col == v5.col;
-
-				const bool has_texture =
-					v0.uv != white_uv ||
-					v1.uv != white_uv ||
-					v2.uv != white_uv ||
-					v3.uv != white_uv ||
-					v4.uv != white_uv ||
-					v5.uv != white_uv;
-
-				min.x = std::max(min.x, pcmd.ClipRect.x);
-				min.y = std::max(min.y, pcmd.ClipRect.y);
-				max.x = std::min(max.x, pcmd.ClipRect.z - 0.5f);
-				max.y = std::min(max.y, pcmd.ClipRect.w - 0.5f);
-
-				if (max.x < min.x || max.y < min.y) { i+=6; continue; } // Completely clipped
-
-				const auto num_pixels = (max.x - min.x) * (max.y - min.y) * target.scale.x * target.scale.y;
-
-				if (has_uniform_color) {
-					if (has_texture) {
-						stats->textured_rectangle_pixels += num_pixels;
-					} else {
-						paint_uniform_rectangle(target, min, max, ColorInt(v0.col), stats);
-						i += 6;
-						continue;
-					}
-				} else {
-					if (has_texture) {
-						// I have never encountered these.
-						stats->gradient_textured_rectangle_pixels += num_pixels;
-					} else {
-						// Color picker. TODO: Optimize
-						stats->gradient_rectangle_pixels += num_pixels;
-					}
-				}
-			}
-		}
-
-		const bool has_texture = (v0.uv != white_uv || v1.uv != white_uv || v2.uv != white_uv);
-		paint_triangle(target, has_texture ? texture : nullptr, pcmd.ClipRect, v0, v1, v2, stats);
-		i += 3;
-	}
-}
-
-void paint_draw_list(const PaintTarget& target, const ImDrawList* cmd_list, const SwOptions& options, Stats* stats)
-{
-	const ImDrawIdx* idx_buffer = &cmd_list->IdxBuffer[0];
-	const ImDrawVert* vertices = cmd_list->VtxBuffer.Data;
-
-	for (int cmd_i = 0; cmd_i < cmd_list->CmdBuffer.size(); cmd_i++)
-	{
-		const ImDrawCmd& pcmd = cmd_list->CmdBuffer[cmd_i];
-		if (pcmd.UserCallback) {
-			pcmd.UserCallback(cmd_list, &pcmd);
-		} else {
-			paint_draw_cmd(target, vertices, idx_buffer, pcmd, options, stats);
-		}
-		idx_buffer += pcmd.ElemCount;
-	}
-}
-
-} // namespace
-
-void make_style_fast()
-{
-	ImGuiStyle& style = ImGui::GetStyle();
-
-	style.AntiAliasedLines = false;
-	style.AntiAliasedFill = false;
-	style.WindowRounding = 0;
-}
-
-void restore_style()
-{
-	ImGuiStyle& style = ImGui::GetStyle();
-	const ImGuiStyle default_style = ImGuiStyle();
-	style.AntiAliasedLines = default_style.AntiAliasedLines;
-	style.AntiAliasedFill = default_style.AntiAliasedFill;
-	style.WindowRounding = default_style.WindowRounding;
-}
-
-void bind_imgui_painting()
-{
-	ImGuiIO& io = ImGui::GetIO();
-
-	// Load default font (embedded in code):
-	uint8_t* tex_data;
-	int font_width, font_height;
-	io.Fonts->GetTexDataAsAlpha8(&tex_data, &font_width, &font_height);
-	const auto texture = new Texture{tex_data, font_width, font_height};
-	io.Fonts->TexID = texture;
-}
-
-static Stats s_stats; // TODO: pass as an argument?
-
-void paint_imgui(uint32_t* pixels, int width_pixels, int height_pixels, const SwOptions& options)
-{
-	const float width_points = ImGui::GetIO().DisplaySize.x;
-	const float height_points = ImGui::GetIO().DisplaySize.y;
-	const ImVec2 scale{width_pixels / width_points, height_pixels / height_points};
-	PaintTarget target{pixels, width_pixels, height_pixels, scale};
-	const ImDrawData* draw_data = ImGui::GetDrawData();
-
-	s_stats = Stats{};
-	for (int i = 0; i < draw_data->CmdListsCount; ++i) {
-		paint_draw_list(target, draw_data->CmdLists[i], options, &s_stats);
-	}
-}
-
-void unbind_imgui_painting()
-{
-	ImGuiIO& io = ImGui::GetIO();
-	delete reinterpret_cast<Texture*>(io.Fonts->TexID);
-	io.Fonts = nullptr;
-}
-
-bool show_options(SwOptions* io_options)
-{
-	assert(io_options);
-	bool changed = false;
-	changed |= ImGui::Checkbox("optimize_text", &io_options->optimize_text);
-	changed |= ImGui::Checkbox("optimize_rectangles", &io_options->optimize_rectangles);
-	return changed;
-}
-
-void show_stats()
-{
-	ImGui::Text("uniform_triangle_pixels:            %7d",   s_stats.uniform_triangle_pixels);
-	ImGui::Text("textured_triangle_pixels:           %7d",   s_stats.textured_triangle_pixels);
-	ImGui::Text("gradient_triangle_pixels:           %7d",   s_stats.gradient_triangle_pixels);
-	ImGui::Text("font_pixels:                        %7d",   s_stats.font_pixels);
-	ImGui::Text("uniform_rectangle_pixels:           %7.0f", s_stats.uniform_rectangle_pixels);
-	ImGui::Text("textured_rectangle_pixels:          %7.0f", s_stats.textured_rectangle_pixels);
-	ImGui::Text("gradient_rectangle_pixels:          %7.0f", s_stats.gradient_rectangle_pixels);
-	ImGui::Text("gradient_textured_rectangle_pixels: %7.0f", s_stats.gradient_textured_rectangle_pixels);
-}
+  namespace
+  {
+
+    const Texture *fontTexture = nullptr;
+#if !defined(IMGUI_HAS_TEXTURES)
+    Texture legacyFontTexture;
+#endif
+
+#if defined(IMGUI_HAS_TEXTURES)
+    struct BackendTexture
+    {
+      Texture texture;
+    };
+#endif
+
+    static inline ImTextureID texture_to_imgui_id(const Texture *texture)
+    {
+#if IMGUI_VERSION_NUM >= 19104
+      return static_cast<ImTextureID>(reinterpret_cast<uintptr_t>(texture));
+#else
+      return reinterpret_cast<ImTextureID>(const_cast<Texture *>(texture));
+#endif
+    }
+
+    static inline const Texture *texture_from_imgui_id(ImTextureID texture_id)
+    {
+#if IMGUI_VERSION_NUM >= 19104
+      return reinterpret_cast<const Texture *>(static_cast<uintptr_t>(texture_id));
+#else
+      return reinterpret_cast<const Texture *>(texture_id);
+#endif
+    }
+
+    struct Stats
+    {
+      int uniform_triangle_pixels = 0;
+      int textured_triangle_pixels = 0;
+      int gradient_triangle_pixels = 0;
+      int font_pixels = 0;
+      double uniform_rectangle_pixels = 0;
+      double textured_rectangle_pixels = 0;
+      double gradient_rectangle_pixels = 0;
+      double gradient_textured_rectangle_pixels = 0;
+    };
+
+    struct PaintTarget
+    {
+      uint32_t *pixels;
+      int width;
+      int height;
+      ImVec2 scale; // Multiply ImGui coordinates by this to get framebuffer pixels.
+      ImVec2 display_pos;
+    };
+
+    using Int = int64_t;
+    static constexpr Int kFixedBias = 256;
+    static constexpr float kInv255 = 1.0f / 255.0f;
+
+    struct Point
+    {
+      Int x;
+      Int y;
+    };
+
+    struct Barycentric
+    {
+      float w0;
+      float w1;
+      float w2;
+    };
+
+    struct EdgeWalker
+    {
+      Int row;
+      Int dx;
+      Int dy;
+    };
+
+    struct TriangleSetup
+    {
+      ImVec2 p0;
+      ImVec2 p1;
+      ImVec2 p2;
+      float area;
+      int min_x;
+      int min_y;
+      int max_x;
+      int max_y;
+      EdgeWalker e0;
+      EdgeWalker e1;
+      EdgeWalker e2;
+    };
+
+    static inline uint32_t channel_u8(uint32_t color, unsigned shift)
+    {
+      return (color >> shift) & 0xffu;
+    }
+
+    static inline uint32_t div255(uint32_t x)
+    {
+      return (x + 1u + (x >> 8u)) >> 8u;
+    }
+
+    static inline uint32_t blend_packed(uint32_t target, uint32_t source)
+    {
+      const uint32_t sa = channel_u8(source, IM_COL32_A_SHIFT);
+      if (sa == 0u)
+      {
+        return target;
+      }
+      if (sa == 255u)
+      {
+        return source;
+      }
+
+      const uint32_t inv_a = 255u - sa;
+      const uint32_t r = div255(channel_u8(source, IM_COL32_R_SHIFT) * sa + channel_u8(target, IM_COL32_R_SHIFT) * inv_a);
+      const uint32_t g = div255(channel_u8(source, IM_COL32_G_SHIFT) * sa + channel_u8(target, IM_COL32_G_SHIFT) * inv_a);
+      const uint32_t b = div255(channel_u8(source, IM_COL32_B_SHIFT) * sa + channel_u8(target, IM_COL32_B_SHIFT) * inv_a);
+
+      const uint32_t a = sa + div255(channel_u8(target, IM_COL32_A_SHIFT) * inv_a);
+      return (a << IM_COL32_A_SHIFT) | (r << IM_COL32_R_SHIFT) | (g << IM_COL32_G_SHIFT) | (b << IM_COL32_B_SHIFT);
+    }
+
+    static inline uint32_t modulate_packed(uint32_t lhs, uint32_t rhs)
+    {
+      const uint32_t r = div255(channel_u8(lhs, IM_COL32_R_SHIFT) * channel_u8(rhs, IM_COL32_R_SHIFT));
+      const uint32_t g = div255(channel_u8(lhs, IM_COL32_G_SHIFT) * channel_u8(rhs, IM_COL32_G_SHIFT));
+      const uint32_t b = div255(channel_u8(lhs, IM_COL32_B_SHIFT) * channel_u8(rhs, IM_COL32_B_SHIFT));
+      const uint32_t a = div255(channel_u8(lhs, IM_COL32_A_SHIFT) * channel_u8(rhs, IM_COL32_A_SHIFT));
+      return (r << IM_COL32_R_SHIFT) | (g << IM_COL32_G_SHIFT) | (b << IM_COL32_B_SHIFT) | (a << IM_COL32_A_SHIFT);
+    }
+
+    static inline ImVec4 color_convert_u32_to_float4(ImU32 in)
+    {
+      return ImVec4(channel_u8(in, IM_COL32_R_SHIFT) * kInv255,
+                    channel_u8(in, IM_COL32_G_SHIFT) * kInv255,
+                    channel_u8(in, IM_COL32_B_SHIFT) * kInv255,
+                    channel_u8(in, IM_COL32_A_SHIFT) * kInv255);
+    }
+
+    static inline ImU32 color_convert_float4_to_u32(const ImVec4 &in)
+    {
+      return (uint32_t(std::clamp(in.x, 0.0f, 1.0f) * 255.0f + 0.5f) << IM_COL32_R_SHIFT) | (uint32_t(std::clamp(in.y, 0.0f, 1.0f) * 255.0f + 0.5f) << IM_COL32_G_SHIFT) | (uint32_t(std::clamp(in.z, 0.0f, 1.0f) * 255.0f + 0.5f) << IM_COL32_B_SHIFT) | (uint32_t(std::clamp(in.w, 0.0f, 1.0f) * 255.0f + 0.5f) << IM_COL32_A_SHIFT);
+    }
+
+    static inline void bary_add(Barycentric &a, const Barycentric &b)
+    {
+      a.w0 += b.w0;
+      a.w1 += b.w1;
+      a.w2 += b.w2;
+    }
+
+    static inline float min3(float a, float b, float c)
+    {
+      const float ab = a < b ? a : b;
+      return ab < c ? ab : c;
+    }
+
+    static inline float max3(float a, float b, float c)
+    {
+      const float ab = a > b ? a : b;
+      return ab > c ? ab : c;
+    }
+
+    static inline float barycentric(const ImVec2 &a, const ImVec2 &b, const ImVec2 &point)
+    {
+      return (b.x - a.x) * (point.y - a.y) - (b.y - a.y) * (point.x - a.x);
+    }
+
+    static inline Int orient2d(const Point &a, const Point &b, const Point &c)
+    {
+      return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    }
+
+    static inline Int floor_fixed(float v)
+    {
+      const float scaled = v * float(kFixedBias);
+      Int i = static_cast<Int>(scaled);
+      i -= static_cast<Int>(scaled < static_cast<float>(i));
+      return i;
+    }
+
+    static inline Point as_point(const ImVec2 &v)
+    {
+      return Point{floor_fixed(v.x), floor_fixed(v.y)};
+    }
+
+    static inline bool is_dominant_edge(const ImVec2 &edge)
+    {
+      return edge.y < 0.0f || (edge.y == 0.0f && edge.x > 0.0f);
+    }
+
+    static inline bool clip_edge_span(Int row, Int delta, int width, int &begin, int &end)
+    {
+      if (delta > 0)
+      {
+        if (row < 0)
+        {
+          const Int need = -row;
+          const Int n = 1 + (need - 1) / delta;
+          if (n >= width)
+            return false;
+          if (n > begin)
+            begin = static_cast<int>(n);
+        }
+      }
+      else if (delta < 0)
+      {
+        if (row < 0)
+          return false;
+        const Int exclusive = row / -delta + 1;
+        if (exclusive < end)
+          end = static_cast<int>(exclusive);
+      }
+      else if (row < 0)
+      {
+        return false;
+      }
+      return begin < end;
+    }
+
+    static inline bool clip_scanline_span(Int row0, Int dx0, Int row1, Int dx1, Int row2, Int dx2, int width, int &begin, int &end)
+    {
+      begin = 0;
+      end = width;
+      return clip_edge_span(row0, dx0, width, begin, end) && clip_edge_span(row1, dx1, width, begin, end) && clip_edge_span(row2, dx2, width, begin, end);
+    }
+
+    static inline uint32_t texel(const Texture &texture, int x, int y)
+    {
+      if (texture.alpha8)
+        return IM_COL32(255, 255, 255, reinterpret_cast<const uint8_t *>(texture.pixels)[x + y * texture.width]);
+      return texture.pixels[x + y * texture.width];
+    }
+
+    static inline uint32_t sample_texture(const Texture &texture, float u, float v)
+    {
+      if (!texture.bilinear)
+      {
+        const int x = static_cast<int>(std::clamp(u * texture.width, 0.0f, float(texture.width - 1)));
+        const int y = static_cast<int>(std::clamp(v * texture.height, 0.0f, float(texture.height - 1)));
+        return texel(texture, x, y);
+      }
+      const float x = std::clamp(u * texture.width - 0.5f, 0.0f, float(texture.width - 1));
+      const float y = std::clamp(v * texture.height - 0.5f, 0.0f, float(texture.height - 1));
+      const int x0 = static_cast<int>(x), y0 = static_cast<int>(y);
+      const int x1 = std::min(x0 + 1, texture.width - 1), y1 = std::min(y0 + 1, texture.height - 1);
+      const float fx = x - x0, fy = y - y0;
+      const uint32_t c00 = texel(texture, x0, y0), c10 = texel(texture, x1, y0);
+      const uint32_t c01 = texel(texture, x0, y1), c11 = texel(texture, x1, y1);
+      uint32_t result = 0;
+      for (unsigned shift = 0; shift < 32; shift += 8)
+      {
+        const float top = channel_u8(c00, shift) * (1.0f - fx) + channel_u8(c10, shift) * fx;
+        const float bottom = channel_u8(c01, shift) * (1.0f - fx) + channel_u8(c11, shift) * fx;
+        result |= uint32_t(top * (1.0f - fy) + bottom * fy + 0.5f) << shift;
+      }
+      return result;
+    }
+
+    static inline int pixel_bound(float coordinate, int limit)
+    {
+      return static_cast<int>(std::clamp(std::ceil(coordinate - 0.5f), 0.0f, float(limit)));
+    }
+
+    static bool setup_triangle(const PaintTarget &target,
+                               const ImVec4 &clip_rect,
+                               const ImDrawVert &v0,
+                               const ImDrawVert &v1,
+                               const ImDrawVert &v2,
+                               TriangleSetup &out)
+    {
+      const float sx = target.scale.x;
+      const float sy = target.scale.y;
+      const float dx = target.display_pos.x;
+      const float dy = target.display_pos.y;
+
+      out.p0 = ImVec2(sx * (v0.pos.x - dx), sy * (v0.pos.y - dy));
+      out.p1 = ImVec2(sx * (v1.pos.x - dx), sy * (v1.pos.y - dy));
+      out.p2 = ImVec2(sx * (v2.pos.x - dx), sy * (v2.pos.y - dy));
+
+      const Point p0i = as_point(out.p0), p1i = as_point(out.p1), p2i = as_point(out.p2);
+      out.p0 = ImVec2(float(p0i.x) / kFixedBias, float(p0i.y) / kFixedBias);
+      out.p1 = ImVec2(float(p1i.x) / kFixedBias, float(p1i.y) / kFixedBias);
+      out.p2 = ImVec2(float(p2i.x) / kFixedBias, float(p2i.y) / kFixedBias);
+
+      out.area = barycentric(out.p0, out.p1, out.p2);
+      if (out.area == 0.0f)
+      {
+        return false;
+      }
+
+      float min_x = min3(out.p0.x, out.p1.x, out.p2.x);
+      float min_y = min3(out.p0.y, out.p1.y, out.p2.y);
+      float max_x = max3(out.p0.x, out.p1.x, out.p2.x);
+      float max_y = max3(out.p0.y, out.p1.y, out.p2.y);
+
+      const float clip_min_x = sx * (clip_rect.x - dx);
+      const float clip_min_y = sy * (clip_rect.y - dy);
+      const float clip_max_x = sx * (clip_rect.z - dx);
+      const float clip_max_y = sy * (clip_rect.w - dy);
+
+      min_x = std::max(min_x, clip_min_x);
+      min_y = std::max(min_y, clip_min_y);
+      max_x = std::min(max_x, clip_max_x);
+      max_y = std::min(max_y, clip_max_y);
+
+      out.min_x = pixel_bound(min_x, target.width);
+      out.min_y = pixel_bound(min_y, target.height);
+      out.max_x = pixel_bound(max_x, target.width);
+      out.max_y = pixel_bound(max_y, target.height);
+
+      if (out.min_x >= out.max_x || out.min_y >= out.max_y)
+      {
+        return false;
+      }
+
+      const int sign = out.area > 0.0f ? 1 : -1;
+      const int bias0 = is_dominant_edge(ImVec2(sign * (out.p2.x - out.p1.x), sign * (out.p2.y - out.p1.y))) ? 0 : -1;
+      const int bias1 = is_dominant_edge(ImVec2(sign * (out.p0.x - out.p2.x), sign * (out.p0.y - out.p2.y))) ? 0 : -1;
+      const int bias2 = is_dominant_edge(ImVec2(sign * (out.p1.x - out.p0.x), sign * (out.p1.y - out.p0.y))) ? 0 : -1;
+
+      const Point start{Int(out.min_x) * kFixedBias + kFixedBias / 2,
+                        Int(out.min_y) * kFixedBias + kFixedBias / 2};
+
+      out.e0.row = Int(sign) * orient2d(p1i, p2i, start) + bias0;
+      out.e1.row = Int(sign) * orient2d(p2i, p0i, start) + bias1;
+      out.e2.row = Int(sign) * orient2d(p0i, p1i, start) + bias2;
+
+      out.e0.dx = Int(sign) * (p1i.y - p2i.y) * kFixedBias;
+      out.e1.dx = Int(sign) * (p2i.y - p0i.y) * kFixedBias;
+      out.e2.dx = Int(sign) * (p0i.y - p1i.y) * kFixedBias;
+
+      out.e0.dy = Int(sign) * (p2i.x - p1i.x) * kFixedBias;
+      out.e1.dy = Int(sign) * (p0i.x - p2i.x) * kFixedBias;
+      out.e2.dy = Int(sign) * (p1i.x - p0i.x) * kFixedBias;
+
+      return true;
+    }
+
+    static void paint_uniform_rectangle(const PaintTarget &target,
+                                        float min_x,
+                                        float min_y,
+                                        float max_x,
+                                        float max_y,
+                                        uint32_t color)
+    {
+      int x0 = pixel_bound(target.scale.x * (min_x - target.display_pos.x), target.width);
+      int y0 = pixel_bound(target.scale.y * (min_y - target.display_pos.y), target.height);
+      int x1 = pixel_bound(target.scale.x * (max_x - target.display_pos.x), target.width);
+      int y1 = pixel_bound(target.scale.y * (max_y - target.display_pos.y), target.height);
+
+      x0 = std::max(x0, 0);
+      y0 = std::max(y0, 0);
+      x1 = std::min(x1, target.width);
+      y1 = std::min(y1, target.height);
+      if (x0 >= x1 || y0 >= y1)
+      {
+        return;
+      }
+
+      const uint32_t alpha = channel_u8(color, IM_COL32_A_SHIFT);
+      if (alpha == 0u)
+      {
+        return;
+      }
+
+      const int count = x1 - x0;
+      uint32_t *row = target.pixels + y0 * target.width + x0;
+
+      if (alpha == 255u)
+      {
+        for (int y = y0; y < y1; ++y)
+        {
+          uint32_t *p = row;
+          uint32_t *const end = p + count;
+          while (p != end)
+          {
+            *p++ = color;
+          }
+          row += target.width;
+        }
+        return;
+      }
+
+      uint32_t last_target = *row;
+      uint32_t last_output = blend_packed(last_target, color);
+
+      for (int y = y0; y < y1; ++y)
+      {
+        uint32_t *p = row;
+        uint32_t *const end = p + count;
+        while (p != end)
+        {
+          const uint32_t target_pixel = *p;
+          if (target_pixel == last_target)
+          {
+            *p = last_output;
+          }
+          else
+          {
+            last_target = target_pixel;
+            last_output = blend_packed(target_pixel, color);
+            *p = last_output;
+          }
+          ++p;
+        }
+        row += target.width;
+      }
+    }
+
+    static void paint_uniform_textured_rectangle(const PaintTarget &target,
+                                                 const Texture &texture,
+                                                 const ImVec4 &clip_rect,
+                                                 const ImDrawVert &min_v,
+                                                 const ImDrawVert &max_v)
+    {
+      const float sx = target.scale.x;
+      const float sy = target.scale.y;
+      const float display_x = target.display_pos.x;
+      const float display_y = target.display_pos.y;
+
+      const ImVec2 min_p(sx * (min_v.pos.x - display_x), sy * (min_v.pos.y - display_y));
+      const ImVec2 max_p(sx * (max_v.pos.x - display_x), sy * (max_v.pos.y - display_y));
+
+      const float distance_x = max_p.x - min_p.x;
+      const float distance_y = max_p.y - min_p.y;
+      if (distance_x == 0.0f || distance_y == 0.0f)
+      {
+        return;
+      }
+
+      float min_x = std::max(min_p.x, sx * (clip_rect.x - display_x));
+      float min_y = std::max(min_p.y, sy * (clip_rect.y - display_y));
+      float max_x = std::min(max_p.x, sx * (clip_rect.z - display_x));
+      float max_y = std::min(max_p.y, sy * (clip_rect.w - display_y));
+
+      int x0 = pixel_bound(min_x, target.width);
+      int y0 = pixel_bound(min_y, target.height);
+      int x1 = pixel_bound(max_x, target.width);
+      int y1 = pixel_bound(max_y, target.height);
+      if (x0 >= x1 || y0 >= y1 || texture.width <= 0 || texture.height <= 0 || texture.pixels == nullptr)
+      {
+        return;
+      }
+
+      const ImVec2 delta_uv_per_pixel((max_v.uv.x - min_v.uv.x) / distance_x,
+                                      (max_v.uv.y - min_v.uv.y) / distance_y);
+      for (int y = y0; y < y1; ++y)
+      {
+        const float v = min_v.uv.y + (float(y) + 0.5f - min_p.y) * delta_uv_per_pixel.y;
+        uint32_t *dst = target.pixels + y * target.width + x0;
+        for (int x = x0; x < x1; ++x, ++dst)
+        {
+          const float u = min_v.uv.x + (float(x) + 0.5f - min_p.x) * delta_uv_per_pixel.x;
+          *dst = blend_packed(*dst, modulate_packed(sample_texture(texture, u, v), min_v.col));
+        }
+      }
+    }
+
+    static void paint_uniform_triangle(const PaintTarget &target,
+                                       const TriangleSetup &tri,
+                                       uint32_t color)
+    {
+      const uint32_t alpha = channel_u8(color, IM_COL32_A_SHIFT);
+      if (alpha == 0u)
+      {
+        return;
+      }
+
+      Int e0_row = tri.e0.row;
+      Int e1_row = tri.e1.row;
+      Int e2_row = tri.e2.row;
+
+      uint32_t last_target = 0u;
+      uint32_t last_output = blend_packed(last_target, color);
+      const int box_width = tri.max_x - tri.min_x;
+
+      for (int y = tri.min_y; y < tri.max_y; ++y)
+      {
+        int begin;
+        int end;
+        if (clip_scanline_span(e0_row, tri.e0.dx, e1_row, tri.e1.dx, e2_row, tri.e2.dx, box_width, begin, end))
+        {
+          uint32_t *dst = target.pixels + y * target.width + tri.min_x + begin;
+          uint32_t *const dst_end = target.pixels + y * target.width + tri.min_x + end;
+
+          if (alpha == 255u)
+          {
+            while (dst != dst_end)
+            {
+              *dst++ = color;
+            }
+          }
+          else
+          {
+            while (dst != dst_end)
+            {
+              const uint32_t target_pixel = *dst;
+              if (target_pixel == last_target)
+              {
+                *dst = last_output;
+              }
+              else
+              {
+                last_target = target_pixel;
+                last_output = blend_packed(target_pixel, color);
+                *dst = last_output;
+              }
+              ++dst;
+            }
+          }
+        }
+
+        e0_row += tri.e0.dy;
+        e1_row += tri.e1.dy;
+        e2_row += tri.e2.dy;
+      }
+    }
+
+    static void paint_shaded_triangle(const PaintTarget &target,
+                                      const TriangleSetup &tri,
+                                      const Texture *texture,
+                                      const ImDrawVert &v0,
+                                      const ImDrawVert &v1,
+                                      const ImDrawVert &v2,
+                                      bool uniform_color)
+    {
+      const ImVec2 topleft(float(tri.min_x) + 0.5f, float(tri.min_y) + 0.5f);
+      const ImVec2 one_x(topleft.x + 1.0f, topleft.y);
+      const ImVec2 one_y(topleft.x, topleft.y + 1.0f);
+
+      const float w0_topleft = barycentric(tri.p1, tri.p2, topleft);
+      const float w1_topleft = barycentric(tri.p2, tri.p0, topleft);
+      const float w2_topleft = barycentric(tri.p0, tri.p1, topleft);
+
+      const float w0_dx = barycentric(tri.p1, tri.p2, one_x) - w0_topleft;
+      const float w1_dx = barycentric(tri.p2, tri.p0, one_x) - w1_topleft;
+      const float w2_dx = barycentric(tri.p0, tri.p1, one_x) - w2_topleft;
+
+      const float w0_dy = barycentric(tri.p1, tri.p2, one_y) - w0_topleft;
+      const float w1_dy = barycentric(tri.p2, tri.p0, one_y) - w1_topleft;
+      const float w2_dy = barycentric(tri.p0, tri.p1, one_y) - w2_topleft;
+
+      const float inv_area = 1.0f / tri.area;
+      Barycentric bary_row{w0_topleft * inv_area, w1_topleft * inv_area, w2_topleft * inv_area};
+      const Barycentric bary_dx{w0_dx * inv_area, w1_dx * inv_area, w2_dx * inv_area};
+      const Barycentric bary_dy{w0_dy * inv_area, w1_dy * inv_area, w2_dy * inv_area};
+
+      const ImVec4 c0 = color_convert_u32_to_float4(v0.col);
+      ImVec4 c1;
+      ImVec4 c2;
+      if (!uniform_color)
+      {
+        c1 = color_convert_u32_to_float4(v1.col);
+        c2 = color_convert_u32_to_float4(v2.col);
+      }
+
+      if (texture && (texture->width <= 0 || texture->height <= 0 || texture->pixels == nullptr))
+      {
+        return;
+      }
+
+      Int e0_row = tri.e0.row;
+      Int e1_row = tri.e1.row;
+      Int e2_row = tri.e2.row;
+      const int box_width = tri.max_x - tri.min_x;
+
+      for (int y = tri.min_y; y < tri.max_y; ++y)
+      {
+        int begin;
+        int end;
+        if (clip_scanline_span(e0_row, tri.e0.dx, e1_row, tri.e1.dx, e2_row, tri.e2.dx, box_width, begin, end))
+        {
+          Barycentric bary = bary_row;
+          for (int n = 0; n < begin; ++n)
+          {
+            bary_add(bary, bary_dx);
+          }
+
+          uint32_t *dst = target.pixels + y * target.width + tri.min_x + begin;
+          const int count = end - begin;
+          for (int n = 0; n < count; ++n)
+          {
+            const float w0 = bary.w0;
+            const float w1 = bary.w1;
+            const float w2 = bary.w2;
+
+            ImVec4 src_color;
+            if (uniform_color)
+            {
+              src_color = c0;
+            }
+            else
+            {
+              src_color.x = w0 * c0.x + w1 * c1.x + w2 * c2.x;
+              src_color.y = w0 * c0.y + w1 * c1.y + w2 * c2.y;
+              src_color.z = w0 * c0.z + w1 * c1.z + w2 * c2.z;
+              src_color.w = w0 * c0.w + w1 * c1.w + w2 * c2.w;
+            }
+
+            if (texture)
+            {
+              const float u = w0 * v0.uv.x + w1 * v1.uv.x + w2 * v2.uv.x;
+              const float v = w0 * v0.uv.y + w1 * v1.uv.y + w2 * v2.uv.y;
+              const ImVec4 tex_color = color_convert_u32_to_float4(sample_texture(*texture, u, v));
+              src_color.x *= tex_color.x;
+              src_color.y *= tex_color.y;
+              src_color.z *= tex_color.z;
+              src_color.w *= tex_color.w;
+            }
+
+            *dst = blend_packed(*dst, color_convert_float4_to_u32(src_color));
+
+            ++dst;
+            bary_add(bary, bary_dx);
+          }
+        }
+
+        e0_row += tri.e0.dy;
+        e1_row += tri.e1.dy;
+        e2_row += tri.e2.dy;
+        bary_add(bary_row, bary_dy);
+      }
+    }
+
+    static void paint_triangle(const PaintTarget &target,
+                               const Texture *texture,
+                               const ImVec4 &clip_rect,
+                               const ImDrawVert &v0,
+                               const ImDrawVert &v1,
+                               const ImDrawVert &v2)
+    {
+      TriangleSetup tri;
+      if (!setup_triangle(target, clip_rect, v0, v1, v2, tri))
+      {
+        return;
+      }
+
+      const bool uniform_color = v0.col == v1.col && v0.col == v2.col;
+      if (uniform_color && !texture)
+      {
+        paint_uniform_triangle(target, tri, v0.col);
+        return;
+      }
+
+      paint_shaded_triangle(target, tri, texture, v0, v1, v2, uniform_color);
+    }
+
+    static inline bool uv_is_white(const ImVec2 &uv, const ImVec2 &white_uv)
+    {
+      return uv.x == white_uv.x && uv.y == white_uv.y;
+    }
+
+    static void paint_draw_cmd(const PaintTarget &target,
+                               const ImDrawVert *vertices,
+                               const ImDrawIdx *idx_buffer,
+                               const ImDrawCmd &pcmd,
+                               const ImVec2 &white_uv,
+                               const SwOptions &options)
+    {
+      const Texture *const texture = texture_from_imgui_id(pcmd.GetTexID());
+      assert(texture);
+      if (!texture || texture->width <= 0 || texture->height <= 0 || texture->pixels == nullptr)
+      {
+        return;
+      }
+
+  
+#if IMGUI_VERSION_NUM >= 19200
+      const bool is_font_atlas = pcmd.GetTexID() == ImGui::GetIO().Fonts->TexRef.GetTexID();
+#else
+      const bool is_font_atlas = texture == fontTexture;
+#endif
+
+      const int elem_count = static_cast<int>(pcmd.ElemCount);
+
+      for (int i = 0; i + 3 <= elem_count;)
+      {
+        const ImDrawVert &v0 = vertices[idx_buffer[i + 0]];
+        const ImDrawVert &v1 = vertices[idx_buffer[i + 1]];
+        const ImDrawVert &v2 = vertices[idx_buffer[i + 2]];
+
+        if ((options.optimize_text || options.optimize_rectangles) && i + 6 <= elem_count && idx_buffer[i + 3] == idx_buffer[i] && idx_buffer[i + 4] == idx_buffer[i + 2])
+        {
+          const ImDrawVert &v3 = vertices[idx_buffer[i + 5]];
+          const bool is_quad = v0.pos.x == v3.pos.x && v1.pos.x == v2.pos.x && v0.pos.y == v1.pos.y && v2.pos.y == v3.pos.y && v0.pos.x < v2.pos.x && v0.pos.y < v2.pos.y && v0.col == v1.col && v0.col == v2.col && v0.col == v3.col;
+          const bool has_texture = !is_font_atlas || !uv_is_white(v0.uv, white_uv) || !uv_is_white(v1.uv, white_uv) || !uv_is_white(v2.uv, white_uv) || !uv_is_white(v3.uv, white_uv);
+          if (is_quad && has_texture && options.optimize_text && v0.uv.x == v3.uv.x && v1.uv.x == v2.uv.x && v0.uv.y == v1.uv.y && v2.uv.y == v3.uv.y)
+          {
+            paint_uniform_textured_rectangle(target, *texture, pcmd.ClipRect, v0, v2);
+            i += 6;
+            continue;
+          }
+          if (is_quad && !has_texture && options.optimize_rectangles)
+          {
+            paint_uniform_rectangle(target, std::max(v0.pos.x, pcmd.ClipRect.x),
+                                    std::max(v0.pos.y, pcmd.ClipRect.y), std::min(v2.pos.x, pcmd.ClipRect.z),
+                                    std::min(v2.pos.y, pcmd.ClipRect.w), v0.col);
+            i += 6;
+            continue;
+          }
+        }
+
+        const bool has_texture = !is_font_atlas || !uv_is_white(v0.uv, white_uv) || !uv_is_white(v1.uv, white_uv) || !uv_is_white(v2.uv, white_uv);
+        paint_triangle(target, has_texture ? texture : nullptr, pcmd.ClipRect, v0, v1, v2);
+        i += 3;
+      }
+    }
+
+    static void paint_draw_list(
+        const PaintTarget &target, const ImDrawList *cmd_list, const ImVec2 &white_uv, const SwOptions &options)
+    {
+      const ImDrawIdx *idx_buffer = cmd_list->IdxBuffer.Data;
+      const ImDrawVert *vertices = cmd_list->VtxBuffer.Data;
+
+      const int command_count = cmd_list->CmdBuffer.Size;
+      for (int cmd_i = 0; cmd_i < command_count; ++cmd_i)
+      {
+        const ImDrawCmd &pcmd = cmd_list->CmdBuffer[cmd_i];
+        if (pcmd.UserCallback)
+        {
+
+          if (pcmd.UserCallback != ImDrawCallback_ResetRenderState)
+            pcmd.UserCallback(cmd_list, &pcmd);
+        }
+        else if (pcmd.ElemCount != 0)
+        {
+          paint_draw_cmd(target, vertices + pcmd.VtxOffset, idx_buffer + pcmd.IdxOffset, pcmd, white_uv, options);
+        }
+      }
+    }
+
+  } // namespace
+
+  void make_style_fast()
+  {
+    ImGuiStyle &style = ImGui::GetStyle();
+    style.AntiAliasedLines = false;
+    style.AntiAliasedFill = false;
+    style.WindowRounding = 0.0f;
+  }
+
+  void restore_style()
+  {
+    ImGuiStyle &style = ImGui::GetStyle();
+    const ImGuiStyle default_style;
+    style.AntiAliasedLines = default_style.AntiAliasedLines;
+    style.AntiAliasedFill = default_style.AntiAliasedFill;
+    style.WindowRounding = default_style.WindowRounding;
+  }
+
+#if defined(IMGUI_HAS_TEXTURES)
+  static void update_dynamic_texture(ImTextureData *tex)
+  {
+    if (tex == nullptr || tex->Status == ImTextureStatus_OK || tex->Status == ImTextureStatus_Destroyed)
+    {
+      return;
+    }
+
+    if (tex->Status == ImTextureStatus_WantDestroy)
+    {
+      if (tex->UnusedFrames > 0)
+      {
+        BackendTexture *backend = static_cast<BackendTexture *>(tex->BackendUserData);
+        delete backend;
+        tex->BackendUserData = nullptr;
+        tex->SetTexID(ImTextureID_Invalid);
+        tex->SetStatus(ImTextureStatus_Destroyed);
+      }
+      return;
+    }
+
+    assert(tex->Format == ImTextureFormat_RGBA32);
+    if (tex->Format != ImTextureFormat_RGBA32 || tex->Width <= 0 || tex->Height <= 0 || tex->GetPixels() == nullptr)
+    {
+      return;
+    }
+
+    BackendTexture *backend = static_cast<BackendTexture *>(tex->BackendUserData);
+    if (tex->Status == ImTextureStatus_WantCreate)
+    {
+      assert(backend == nullptr);
+      backend = new BackendTexture;
+      tex->BackendUserData = backend;
+      tex->SetTexID(texture_to_imgui_id(&backend->texture));
+    }
+
+    if (backend == nullptr)
+    {
+      return;
+    }
+
+    backend->texture.pixels = reinterpret_cast<const uint32_t *>(tex->GetPixels());
+    backend->texture.width = tex->Width;
+    backend->texture.height = tex->Height;
+    backend->texture.bilinear = true;
+    tex->SetStatus(ImTextureStatus_OK);
+  }
+
+  static void update_dynamic_textures(ImDrawData *draw_data)
+  {
+    if (draw_data == nullptr || draw_data->Textures == nullptr)
+    {
+      return;
+    }
+
+    for (ImTextureData *tex : *draw_data->Textures)
+    {
+      update_dynamic_texture(tex);
+    }
+  }
+#endif
+
+  void bind_imgui_painting()
+  {
+    ImGuiIO &io = ImGui::GetIO();
+    io.BackendRendererName = "imgui_sw";
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
+#if defined(IMGUI_HAS_TEXTURES)
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+    fontTexture = nullptr;
+#else
+    rebuild_font_texture();
+#endif
+  }
+
+  bool rebuild_font_texture()
+  {
+#if defined(IMGUI_HAS_TEXTURES)
+    return true;
+#else
+    ImGuiIO &io = ImGui::GetIO();
+    if (io.Fonts == nullptr)
+    {
+      return false;
+    }
+
+    uint8_t *tex_data = nullptr;
+    int font_width = 0;
+    int font_height = 0;
+    io.Fonts->GetTexDataAsAlpha8(&tex_data, &font_width, &font_height);
+    if (tex_data == nullptr || font_width <= 0 || font_height <= 0)
+    {
+      return false;
+    }
+
+    legacyFontTexture.pixels = reinterpret_cast<const uint32_t *>(tex_data);
+    legacyFontTexture.width = font_width;
+    legacyFontTexture.height = font_height;
+    legacyFontTexture.bilinear = true;
+    legacyFontTexture.alpha8 = true;
+    io.Fonts->TexID = texture_to_imgui_id(&legacyFontTexture);
+    fontTexture = &legacyFontTexture;
+    return true;
+#endif
+  }
+
+  static Stats s_stats;
+
+  void paint_imgui(uint32_t *pixels, ImDrawData *drawData, const SwOptions &options)
+  {
+    if (drawData == nullptr)
+      return;
+#if defined(IMGUI_HAS_TEXTURES)
+    update_dynamic_textures(drawData);
+#endif
+
+    const int fb_width = static_cast<int>(drawData->DisplaySize.x * drawData->FramebufferScale.x);
+    const int fb_height = static_cast<int>(drawData->DisplaySize.y * drawData->FramebufferScale.y);
+    if (!pixels || fb_width <= 0 || fb_height <= 0)
+    {
+      return;
+    }
+
+    const PaintTarget target{pixels, fb_width, fb_height, drawData->FramebufferScale, drawData->DisplayPos};
+#if IMGUI_VERSION_NUM >= 19200
+    const ImVec2 white_uv = ImGui::GetFontTexUvWhitePixel();
+#else
+    const ImVec2 white_uv = ImGui::GetIO().Fonts->TexUvWhitePixel;
+#endif
+
+    s_stats = Stats{};
+#if IMGUI_VERSION_NUM >= 19200
+    for (int i = 0; i < drawData->CmdLists.Size; ++i)
+    {
+      paint_draw_list(target, drawData->CmdLists[i], white_uv, options);
+    }
+#else
+    for (int i = 0; i < drawData->CmdListsCount; ++i)
+    {
+      paint_draw_list(target, drawData->CmdLists[i], white_uv, options);
+    }
+#endif
+  }
+
+  void unbind_imgui_painting()
+  {
+    ImGuiIO &io = ImGui::GetIO();
+    io.BackendRendererName = nullptr;
+    io.BackendFlags &= ~ImGuiBackendFlags_RendererHasVtxOffset;
+
+#if defined(IMGUI_HAS_TEXTURES)
+    ImGuiPlatformIO &platform_io = ImGui::GetPlatformIO();
+    for (ImTextureData *tex : platform_io.Textures)
+    {
+      if (tex != nullptr && tex->BackendUserData != nullptr)
+      {
+        BackendTexture *backend = static_cast<BackendTexture *>(tex->BackendUserData);
+        delete backend;
+        tex->BackendUserData = nullptr;
+        tex->SetTexID(ImTextureID_Invalid);
+        tex->SetStatus(ImTextureStatus_Destroyed);
+      }
+    }
+    io.BackendFlags &= ~ImGuiBackendFlags_RendererHasTextures;
+#else
+    if (io.Fonts != nullptr && texture_from_imgui_id(io.Fonts->TexID) == &legacyFontTexture)
+    {
+      io.Fonts->TexID = texture_to_imgui_id(nullptr);
+    }
+    legacyFontTexture = Texture{};
+#endif
+
+    fontTexture = nullptr;
+  }
+
+  bool show_options(SwOptions *io_options)
+  {
+    assert(io_options);
+    bool changed = false;
+    changed |= ImGui::Checkbox("optimize_text", &io_options->optimize_text);
+    changed |= ImGui::Checkbox("optimize_rectangles", &io_options->optimize_rectangles);
+    return changed;
+  }
+
+  void show_stats()
+  {
+    ImGui::Text("uniform_triangle_pixels:            %7d", s_stats.uniform_triangle_pixels);
+    ImGui::Text("textured_triangle_pixels:           %7d", s_stats.textured_triangle_pixels);
+    ImGui::Text("gradient_triangle_pixels:           %7d", s_stats.gradient_triangle_pixels);
+    ImGui::Text("font_pixels:                        %7d", s_stats.font_pixels);
+    ImGui::Text("uniform_rectangle_pixels:           %7.0f", s_stats.uniform_rectangle_pixels);
+    ImGui::Text("textured_rectangle_pixels:          %7.0f", s_stats.textured_rectangle_pixels);
+    ImGui::Text("gradient_rectangle_pixels:          %7.0f", s_stats.gradient_rectangle_pixels);
+    ImGui::Text("gradient_textured_rectangle_pixels: %7.0f", s_stats.gradient_textured_rectangle_pixels);
+  }
 
 } // namespace imgui_sw
